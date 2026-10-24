@@ -1,0 +1,6 @@
+Hello! 👋
+
+Thanks for the note! It's great to hear that the demo project is greeting its users. Let me know if you need any help or have any questions!
+
+Best regards,
+Your Assistant

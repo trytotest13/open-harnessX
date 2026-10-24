@@ -1,0 +1,13 @@
+{
+  "engine": {
+    "exe": "@APP@\\engine\\llama-server.exe",
+    "host": "127.0.0.1",
+    "port": 8788,
+    "ctxSize": 8192,
+    "threads": 8,
+    "gpuLayers": null,
+    "extraArgs": ["--jinja"],
+    "scanDirs": ["@APP@\\models"]
+  },
+  "defaultModel": "@APP@\\models\\PUT-YOUR-MODEL-HERE.gguf"
+}

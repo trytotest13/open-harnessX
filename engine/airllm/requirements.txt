@@ -1,0 +1,9 @@
+# AirLLM sidecar venv (installed by setup-airllm.bat; kept here for reference).
+# torch must be the CUDA build, hence the extra index URL in the bat file:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+transformers
+accelerate
+einops
+sentencepiece
+bitsandbytes
+huggingface-hub

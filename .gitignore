@@ -1,0 +1,29 @@
+# build artifacts
+launcher/target/
+*.exe
+*.dll
+*.pdb
+
+# private runtime state (sessions, memory, keys) — never publish
+config.json
+data/
+.engine-state.json
+*.log
+*.WebView2/
+
+# models and big binaries
+*.gguf
+*.zip
+models/
+
+# vendored third-party sources — fetched separately, see README (AirLLM)
+research/
+
+# local-only tooling and test artifacts
+gui-test-screenshots/
+shot.js
+installer/Output/
+installer/wv2-boot.exe
+
+# stale binaries
+*.exe.old
