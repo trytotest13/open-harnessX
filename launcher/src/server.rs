@@ -1,4 +1,4 @@
-//! Open Harness web UI server — std-only HTTP on 127.0.0.1:3080 (first free
+//! Open Harness web UI server: std-only HTTP on 127.0.0.1:3080 (first free
 //! port upward). Serves the embedded UI and a small JSON API that wraps the
 //! supervisor's existing model management, plus an SSE proxy to the engine so
 //! the browser never needs CORS.
@@ -56,11 +56,11 @@ fn warm_model_cache() {
 
 /// Bind and serve on a background thread. Returns the chosen port.
 pub fn spawn() -> Result<u16, String> {
-    // 3080 only — never drift upward: 3081 belongs to the dsh agent IDE, and
+    // 3080 only; never drift upward: 3081 belongs to the dsh agent IDE, and
     // this UI silently stealing it makes dsh's webserver fail to bind, which
     // disables most of the IDE's plugins (file tree, terminal, uploads...).
     let listener = TcpListener::bind(("127.0.0.1", 3080)).map_err(|_| {
-        "Open Harness UI port 3080 is busy — another instance may still be \
+        "Open Harness UI port 3080 is busy: another instance may still be \
          running. Close it or run open-harness stop, then start again."
             .to_string()
     })?;
@@ -113,8 +113,8 @@ fn handle(stream: TcpStream) {
     // out chat transcripts and memory, so a page open elsewhere in the browser
     // must not be able to reach it. Refuse requests whose Origin is another
     // site (cross-site fetch/form posts always carry their real Origin) and
-    // whose Host is not this server (DNS rebinding). Local origins — this UI
-    // window, the dsh IDE on 3081 — and non-browser clients (no Origin) pass.
+    // whose Host is not this server (DNS rebinding). Local origins (this UI
+    // window, the dsh IDE on 3081) and non-browser clients (no Origin) pass.
     let is_local = |v: &str| {
         let no_scheme = v.trim_start_matches("http://").trim_start_matches("https://");
         let name = no_scheme.rsplit_once(':').map(|(h, _)| h).unwrap_or(no_scheme);
@@ -155,7 +155,7 @@ fn handle(stream: TcpStream) {
     let result = match route.as_str() {
         "GET /" => {
             // Prefer launcher/ui/index.html next to the exe so UI tweaks
-            // apply with a plain page reload — no rebuild. The embedded copy
+            // apply with a plain page reload, no rebuild. The embedded copy
             // is the fallback when the file is missing.
             let html = std::fs::read(
                 crate::root_dir().join("launcher").join("ui").join("index.html"),
@@ -190,6 +190,7 @@ fn handle(stream: TcpStream) {
         // durable store: sessions mirror, long-term memory, task results
         "GET /api/sessions" => j(&mut client, 200, crate::store::session_list),
         "POST /api/session" => j(&mut client, 200, || body_handler(&body, crate::store::session_save)),
+        "POST /api/keys" => j(&mut client, 200, || keys_write(&body)),
         "GET /api/memory" => j(&mut client, 200, || {
             serde_json::json!({ "memory": crate::store::memory_read() })
         }),
@@ -339,7 +340,7 @@ fn extract_text(ext: &str, bytes: &[u8]) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             Ok(docx_text(&xml))
         }
-        // Everything else — .txt, .md, .csv, code, configs — is read as text.
+        // Everything else (.txt, .md, .csv, code, configs) is read as text.
         // Binary formats that aren't handled come out lossy; the model just
         // sees noise, which is honest enough.
         _ => Ok(String::from_utf8_lossy(bytes).into_owned()),
@@ -568,7 +569,7 @@ fn text(w: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::R
 
 fn j(w: &mut TcpStream, code: u16, f: impl FnOnce() -> serde_json::Value) -> std::io::Result<()> {
     let value = f();
-    // Handlers report their own failures as {"error": ...} — surface those as
+    // Handlers report their own failures as {"error": ...}; surface those as
     // HTTP 400 so the UI's `!r.ok` check throws with the message.
     let status = if code == 404 {
         "404 Not Found"
@@ -617,6 +618,7 @@ pub(crate) fn engine_vision(cfg: &Config) -> bool {
         cfg.engine.port,
         "/props",
         std::time::Duration::from_millis(700),
+        cfg.primary_api_key().as_deref(),
     ) else {
         return false;
     };
@@ -629,8 +631,24 @@ pub(crate) fn engine_vision(cfg: &Config) -> bool {
 fn status_json() -> serde_json::Value {
     let cfg = cfg_or_panic();
     let healthy = crate::engine_healthy(&cfg);
-    let st = crate::state::load(&crate::state_path()).unwrap_or_default();
+    let mut st = crate::state::load(&crate::state_path()).unwrap_or_default();
     let pid_alive = st.engine_pid.is_some_and(crate::pid_alive);
+    // Older state files (and engines started by older builds) have no n_ctx:
+    // ask /props once, persist it and refresh the dsh patch with the real
+    // window the model was given.
+    if healthy && !st.model.is_empty() && st.n_ctx.is_none() {
+        if let Some(n) = crate::engine_n_ctx(&cfg) {
+            st.n_ctx = Some(n);
+            crate::state::save(&crate::state_path(), &st);
+            let _ = crate::patch::write_patch(&cfg, std::path::Path::new(&st.model));
+        }
+    }
+    let ctx_size = if st.model.is_empty() {
+        cfg.engine.ctx_size
+    } else {
+        st.n_ctx
+            .unwrap_or_else(|| cfg.effective_ctx(std::path::Path::new(&st.model)))
+    };
     let load = LOAD.lock().unwrap();
     let vision = healthy && engine_vision(&cfg);
     let ocr = serde_json::json!({
@@ -638,7 +656,7 @@ fn status_json() -> serde_json::Value {
         "running": crate::ocr::running(&cfg),
     });
     serde_json::json!({
-        "engine": { "healthy": healthy, "url": cfg.engine_base_url(), "pidAlive": pid_alive, "ctxSize": cfg.engine.ctx_size, "vision": vision, "ocr": ocr },
+        "engine": { "healthy": healthy, "url": cfg.engine_base_url(), "pidAlive": pid_alive, "ctxSize": ctx_size, "vision": vision, "ocr": ocr },
         "model": (!st.model.is_empty()).then(|| serde_json::json!({
             "path": st.model, "alias": Config::alias_for(Path::new(&st.model)),
         })).unwrap_or(serde_json::Value::Null),
@@ -684,7 +702,7 @@ fn metrics_json() -> serde_json::Value {
     if vram_bytes == 0 && alive {
         // WDDM fallback when even the GPU Engine counter came up empty:
         // attribute the whole GPU's usage (desktop apps hold a few hundred
-        // MiB, so this slightly overestimates — the bar is labelled estimate).
+        // MiB, so this slightly overestimates: the bar is labelled estimate).
         vram_bytes = gpus.first().map(|g| g.used * 1024 * 1024).unwrap_or(0);
     }
     let vram_model = vram_bytes.min(model_size);
@@ -722,9 +740,93 @@ fn metrics_json() -> serde_json::Value {
         "tiers": {"vramBytes": vram_model, "ramBytes": ram_resident, "diskBytes": disk},
         "ramLimitGB": cfg.ram_limit_gb,
         "threads": cfg.engine.threads,
-        "ctxSize": cfg.engine.ctx_size,
+        "ctxSize": if st.model.is_empty() {
+            cfg.engine.ctx_size
+        } else {
+            st.n_ctx
+                .unwrap_or_else(|| cfg.effective_ctx(std::path::Path::new(&st.model)))
+        },
         "profile": profile,
+        // Connection details for pointing other local apps (curl, Cherry
+        // Studio, ...) at this engine: OpenAI-compatible /v1 + bearer key.
+        "localApi": {
+            "baseUrl": cfg.engine_base_url(),
+            "apiKey": cfg.api_keys().first().cloned().unwrap_or_default(),
+            "keys": cfg.api_keys(),
+            "model": (!st.model.is_empty())
+                .then(|| crate::config::Config::alias_for(std::path::Path::new(&st.model)))
+                .unwrap_or_default(),
+        },
     })
+}
+
+/// Manage the engine's bearer keys: `{"action":"add"|"regen"|"revoke",
+/// "index":N}`. Any change rewrites config.json and restarts the engine (the
+/// key list is a startup flag), reusing the same guarded load path the model
+/// picker uses so the UI shows progress and double-clicks are refused.
+fn keys_write(body: &[u8]) -> serde_json::Value {
+    let req = match body_json(body) {
+        Ok(v) => v,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+    let action = req["action"].as_str().unwrap_or("");
+    let cfg = cfg_or_panic();
+    let mut keys = cfg.api_keys();
+
+    match action {
+        "add" => keys.push(crate::generate_api_key()),
+        "regen" => {
+            if keys.is_empty() {
+                keys.push(crate::generate_api_key());
+            } else {
+                keys[0] = crate::generate_api_key();
+            }
+        }
+        "revoke" => {
+            let Some(idx) = req["index"].as_u64().map(|i| i as usize) else {
+                return serde_json::json!({"error": "revoke needs \"index\""});
+            };
+            if idx >= keys.len() {
+                return serde_json::json!({"error": "no such key"});
+            }
+            // The engine must never end up open just because a key was
+            // revoked: refuse to remove the last one instead.
+            if keys.len() == 1 {
+                return serde_json::json!({"error": "cannot revoke the last key: regenerate it instead"});
+            }
+            keys.remove(idx);
+        }
+        other => return serde_json::json!({"error": format!("unknown action {other:?}; use add, regen or revoke")}),
+    }
+    if let Err(e) = crate::write_api_keys(&keys) {
+        return serde_json::json!({"error": e});
+    }
+
+    // Restart the engine with the new key list, unless nothing is running,
+    // in which case the next start picks the keys up anyway.
+    let reloading = crate::loaded_model().is_some();
+    if let Some(model) = crate::loaded_model() {
+        {
+            let mut g = LOAD.lock().unwrap();
+            if g.as_ref().is_some_and(|l| l.active) {
+                return serde_json::json!({"error": "a model is already loading", "busy": true, "keys": keys});
+            }
+            *g = Some(LoadStatus {
+                active: true,
+                target: Some(model.display().to_string()),
+                error: None,
+            });
+        }
+        std::thread::spawn(move || {
+            let result = crate::perform_load(&model, true);
+            let mut g = LOAD.lock().unwrap();
+            if let Some(l) = g.as_mut() {
+                l.active = false;
+                l.error = result.err().map(|e| e.lines().last().unwrap_or(&e).to_string());
+            }
+        });
+    }
+    serde_json::json!({"ok": true, "keys": keys, "reloading": reloading})
 }
 
 fn models_json() -> serde_json::Value {
@@ -737,6 +839,9 @@ fn models_json() -> serde_json::Value {
                 "path": p.display().to_string(),
                 "name": Config::alias_for(&p),
                 "size": std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+                // The model's own window, so the picker can show what each
+                // choice supports before loading it.
+                "ctx": crate::config::model_native_ctx(&p),
                 "loaded": loaded.as_ref().is_some_and(|l| crate::same_path(l, &p)),
                 "isDefault": crate::same_path(&cfg.default_model, &p),
             })
@@ -781,7 +886,7 @@ fn body_handler(
     }
 }
 
-/// POST /api/memory — `{action:"set", text}` replaces the file (UI editor),
+/// POST /api/memory: `{action:"set", text}` replaces the file (UI editor),
 /// `{action:"add", text}` appends one bullet (agent / quick note).
 fn memory_write_json(body: &[u8]) -> serde_json::Value {
     let v = match body_json(body) {
@@ -854,7 +959,7 @@ fn load(body: &[u8]) -> serde_json::Value {
     }
     let model_for_thread = model.clone();
     std::thread::spawn(move || {
-        let result = crate::perform_load(&model_for_thread);
+        let result = crate::perform_load(&model_for_thread, false);
         let mut g = LOAD.lock().unwrap();
         if let Some(l) = g.as_mut() {
             l.active = false;
@@ -868,7 +973,7 @@ fn settings_json() -> serde_json::Value {
     let cfg = cfg_or_panic();
     let e = &cfg.engine;
     serde_json::json!({
-        "ctxSize": e.ctx_size, "threads": e.threads,
+        "ctxSize": e.ctx_size, "autoCtx": e.auto_ctx, "threads": e.threads,
         "gpuLayers": e.gpu_layers, "extraArgs": e.extra_args,
         "host": e.host, "port": e.port,
         "ramLimitGB": cfg.ram_limit_gb,
@@ -876,7 +981,7 @@ fn settings_json() -> serde_json::Value {
     })
 }
 
-/// Full provider records (key included — the page has a masked input, and
+/// Full provider records (key included, the page has a masked input, and
 /// this app is local-only, matching the remoteApis behavior in settings).
 fn providers_json() -> serde_json::Value {
     let cfg = cfg_or_panic();
@@ -903,7 +1008,7 @@ fn providers_write(body: &[u8]) -> serde_json::Value {
             return serde_json::json!({"error": format!("unknown provider format: {fmt}")});
         }
         // Model ids may be empty (the UI autosaves right after "Add model");
-        // empty-id models are inert — chat routing skips them.
+        // empty-id models are inert: chat routing skips them.
     }
     let path = crate::config_path();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -942,11 +1047,14 @@ fn settings_write(body: &[u8]) -> serde_json::Value {
         Some(serde_json::Value::Object(m)) => m,
         _ => return serde_json::json!({"error": "config.json has no engine object"}),
     };
+    // Keys must match EngineConfig's serde(camelCase) field names, otherwise
+    // the saved value is silently ignored at the next load.
     for (key, field) in [
-        ("ctxSize", "ctx_size"),
+        ("ctxSize", "ctxSize"),
+        ("autoCtx", "autoCtx"),
         ("threads", "threads"),
-        ("gpuLayers", "gpu_layers"),
-        ("extraArgs", "extra_args"),
+        ("gpuLayers", "gpuLayers"),
+        ("extraArgs", "extraArgs"),
     ] {
         if let Some(val) = v.get(key) {
             eng.insert(field.into(), val.clone());
@@ -992,7 +1100,7 @@ fn settings_write(body: &[u8]) -> serde_json::Value {
 }
 
 /// Boot the dsh agent IDE on demand (file tree, terminal, agent editing) and
-/// hand the authenticated URL back — the UI embeds it inside this window, so
+/// hand the authenticated URL back: the UI embeds it inside this window, so
 /// everything stays in the one desktop app. The app also pre-starts the IDE,
 /// so this usually answers instantly; ensure_dsh_url single-flights boots.
 fn dsh_open() -> serde_json::Value {
@@ -1050,7 +1158,7 @@ fn proxy_chat(client: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
             }
         }
         // Universal OCR fallback: a provider model not marked vision-capable
-        // gets its image attachments transcribed first — same as the local
+        // gets its image attachments transcribed first, same as the local
         // engine path. An unknown model id passes through untouched.
         let target_vision = req
             .get("model")
@@ -1068,7 +1176,7 @@ fn proxy_chat(client: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
     let profile = (!api_name.is_empty())
         .then(|| cfg.remote_apis.iter().find(|p| p.name == api_name))
         .flatten();
-    // The UI selects a profile by name and sends no model of its own — the
+    // The UI selects a profile by name and sends no model of its own: the
     // profile's model in config.json is the authoritative choice, and remote
     // APIs reject model-less requests (OpenRouter: "No models provided").
     if let Some(p) = profile {
@@ -1095,7 +1203,7 @@ fn proxy_chat(client: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
 
 /// Route the chat through a remote OpenAI-compatible API by piping the
 /// request and its streamed (SSE) response through Windows' bundled curl.exe
-/// — std Rust has no TLS, and curl decodes chunked encoding for us.
+/// (std Rust has no TLS, and curl decodes chunked encoding for us.)
 fn proxy_chat_remote(
     client: &mut TcpStream,
     body: &[u8],
@@ -1168,7 +1276,7 @@ fn proxy_chat_remote(
         return match err_json(
             client,
             502,
-            "remote API gave no response — check the base URL, key and model",
+            "remote API gave no response: check the base URL, key and model",
         ) {
             _ => Ok(()),
         };
@@ -1198,7 +1306,7 @@ pub(crate) fn ocr_rewrite_request(
     }
     if !crate::ocr::available(cfg) {
         return Err(
-            "the target model can't see images and no OCR fallback is configured — \
+            "the target model can't see images and no OCR fallback is configured; \
              add engine.ocrFallback to config.json"
                 .into(),
         );
@@ -1232,7 +1340,7 @@ fn ocr_rewrite<'a>(cfg: &Config, body: &'a [u8]) -> Result<std::borrow::Cow<'a, 
 fn proxy_chat_local(client: &mut TcpStream, body: &[u8], cfg: &Config) -> std::io::Result<()> {
     // Image attachments with a vision-less model: transcribe the images
     // through the OCR fallback sidecar first so any loaded model can "see"
-    // them. Transcriptions are cached — the UI resends image history with
+    // them. Transcriptions are cached: the UI resends image history with
     // every message, and re-OCRing it all each turn would stall the chat.
     let body: std::borrow::Cow<'_, [u8]> = match ocr_rewrite(cfg, body) {
         Ok(b) => b,
@@ -1242,14 +1350,18 @@ fn proxy_chat_local(client: &mut TcpStream, body: &[u8], cfg: &Config) -> std::i
     };
     let mut up = match TcpStream::connect((cfg.engine.host.as_str(), cfg.engine.port)) {
         Ok(u) => u,
-        Err(_) => return match err_json(client, 502, "engine is not reachable — is the model loaded?") {
+        Err(_) => return match err_json(client, 502, "engine is not reachable: is the model loaded?") {
             _ => Ok(()),
         },
     };
     up.set_read_timeout(Some(READ_TIMEOUT)).ok();
+    let auth = cfg
+        .primary_api_key()
+        .map(|k| format!("Authorization: Bearer {k}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+         {auth}Content-Length: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
         cfg.engine.host,
         cfg.engine.port,
         body.len()

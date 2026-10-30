@@ -1,4 +1,4 @@
-//! Minimal blocking HTTP/TCP probes — a launcher only needs status codes and
+//! Minimal blocking HTTP/TCP probes: a launcher only needs status codes and
 //! port liveness, so no async runtime or HTTP client dependency.
 
 use std::io::{Read, Write};
@@ -6,12 +6,15 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 /// GET `path`, return the HTTP status code, or None on any failure.
-pub fn http_status(host: &str, port: u16, path: &str, timeout: Duration) -> Option<u16> {
+/// `bearer` adds an `Authorization: Bearer …` header (the engine requires it
+/// when an API key is configured).
+pub fn http_status(host: &str, port: u16, path: &str, timeout: Duration, bearer: Option<&str>) -> Option<u16> {
     let addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
     let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
-    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    let auth = bearer.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{auth}Connection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut head = [0u8; 1024];
     let n = stream.read(&mut head).ok()?;
@@ -30,12 +33,13 @@ pub fn port_open(host: &str, port: u16) -> bool {
 
 /// GET `path`, return the response body with headers stripped, or None.
 /// HTTP/1.0 keeps llama-server from answering with chunked encoding.
-pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Option<String> {
+pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration, bearer: Option<&str>) -> Option<String> {
     let addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
     let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
-    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    let auth = bearer.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{auth}Connection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok()?;

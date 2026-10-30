@@ -106,7 +106,7 @@ Switch modes in `config.json → engine`:
 ```jsonc
 {
   "engine": {
-    "mode": "airllm",              // default "llamacpp" — remove to go back
+    "mode": "airllm",              // default "llamacpp" (remove to go back)
     "airllmPython": "D:\\Ai Ollama\\airllm-venv\\Scripts\\python.exe",
     "airllmCompression": "4bit"    // optional, ~3x faster decode, near-lossless
   },
@@ -136,7 +136,7 @@ Switch modes in `config.json → engine`:
 
 ## config.json
 
-Copy `config.example.json` to `config.json` and edit. Engine knobs live under `engine` (editable in the UI's *Settings*): model paths, port, context size, threads, `gpuLayers` (`null` = let llama.cpp auto-fit to free VRAM, recommended because manual values that exceed VRAM crash the engine), `extraArgs` (e.g. `--jinja` is required for Qwen3 chat templates), `mmproj` vision adapter rules, the `ocrFallback` sidecar, and `profiles` written by `tune`. `ramLimitGB` sits at the config root; models whose size exceeds it are refused at load, and the engine gets a hard OS working-set cap. Settings apply the next time a model loads.
+Copy `config.example.json` to `config.json` and edit. Engine knobs live under `engine` (editable in the UI's *Settings*): model paths, port, context size, threads, `gpuLayers` (`null` = let llama.cpp auto-fit to free VRAM, recommended because manual values that exceed VRAM crash the engine), `extraArgs` (e.g. `--jinja` is required for Qwen3 chat templates), `mmproj` vision adapter rules, the `ocrFallback` sidecar, and `profiles` written by `tune`. `ramLimitGB` sits at the config root; models whose size exceeds it are refused at load, and the engine gets a hard OS working-set cap. Settings apply the next time a model loads. `apiKeys` gate the engine's OpenAI-compatible API: a key is generated on first start and shown in the dashboard's *API access* card. `thinking: true` keeps reasoning tokens enabled for clients that render them (default off: apps that read only `content` see empty replies). The launcher starts llama-server with `--api-key`, `-ub`, `--cache-reuse`, and (unless thinking) `--reasoning-budget`, so `engine.exe` must be a reasonably recent llama.cpp build; startup failures land in `engine.log`.
 
 ## Tuning notes from a real machine (RTX 4060 8 GB / 15.6 GB RAM)
 

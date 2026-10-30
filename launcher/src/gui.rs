@@ -1,5 +1,5 @@
 //! The one native desktop window (WebView2 via wry + tao): chat, models,
-//! settings and the embedded Agent IDE all live inside it — nothing opens
+//! settings and the embedded Agent IDE all live inside it: nothing opens
 //! extra windows or browser tabs.
 
 use tao::dpi::LogicalSize;
@@ -9,7 +9,7 @@ use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
 /// True when something answers on the fixed UI port with Open Harness's
-/// status JSON — i.e. another Open Harness instance is already running.
+/// status JSON, i.e. another Open Harness instance is already running.
 pub(crate) fn ui_already_serving() -> bool {
     use std::io::{BufRead, BufReader, Write};
     let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", 3080)) else {
@@ -38,12 +38,12 @@ pub fn open_app(
     let event_loop = EventLoopBuilder::<()>::with_user_event().build();
     // Own the UI port when it's free; when a previous instance already serves
     // it (double-click while running), reuse that instance and open a window
-    // on it — never fall back to the browser for this case.
+    // on it: never fall back to the browser for this case.
     let port = match start_server() {
         Ok(p) => p,
         Err(e) => {
             if ui_already_serving() {
-                println!("[oh] stack already running on 3080 — opening a window on it");
+                println!("[oh] stack already running on 3080, opening a window on it");
                 3080
             } else {
                 return Err(e);
@@ -60,7 +60,7 @@ pub fn open_app(
         .map_err(|e| format!("window: {e}"))?;
 
     // build() (not build_as_child) seeds the webview from the parent's full
-    // client area and attaches the parent subclass that tracks WM_SIZE —
+    // client area and attaches the parent subclass that tracks WM_SIZE:
     // build_as_child starts at zero bounds unless seeded, leaving slivers.
     let webview = WebViewBuilder::new()
         .with_url(&url)

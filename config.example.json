@@ -4,14 +4,30 @@
     "host": "127.0.0.1",
     "port": 8788,
     "mode": "llamacpp",
+    "autoCtx": true,
     "ctxSize": 8192,
     "threads": 8,
     "gpuLayers": null,
-    "extraArgs": ["--jinja"],
-    "scanDirs": ["D:\\Ai Models"],
-    "excludePatterns": ["mmproj", "vae", "clip", "lora", "adapter", "whisper", "t5xxl"],
+    "extraArgs": [
+      "--jinja"
+    ],
+    "scanDirs": [
+      "D:\\Ai Models"
+    ],
+    "excludePatterns": [
+      "mmproj",
+      "vae",
+      "clip",
+      "lora",
+      "adapter",
+      "whisper",
+      "t5xxl"
+    ],
     "mmprojRules": [
-      { "modelPattern": "qwen3.8-27b", "path": "D:\\Ai Models\\Qwen3.8-27B-mmproj-f16.gguf" }
+      {
+        "modelPattern": "qwen3.8-27b",
+        "path": "D:\\Ai Models\\Qwen3.8-27B-mmproj-f16.gguf"
+      }
     ],
     "ocrFallback": {
       "model": "D:\\Ai Models\\DeepSeek-OCR-2\\deepseek-ocr-2-Q4_K_M.gguf",
@@ -19,7 +35,9 @@
       "port": 8799,
       "enabled": true
     },
-    "profiles": {}
+    "profiles": {},
+    "apiKey": null,
+    "thinking": false
   },
   "defaultModel": "D:\\Ai Models\\Qwen3.8-27B-UD-Q4_K_M.gguf",
   "ramLimitGB": 17,
@@ -41,7 +59,11 @@
       "format": "anthropic",
       "apiKey": "PASTE-YOUR-KEY",
       "models": [
-        { "id": "claude-sonnet-4-5", "enabled": true, "vision": false }
+        {
+          "id": "claude-sonnet-4-5",
+          "enabled": true,
+          "vision": false
+        }
       ]
     }
   ]

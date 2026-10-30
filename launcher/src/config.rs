@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// A measured performance profile for one model, saved by `open-harness tune`
@@ -63,13 +64,37 @@ pub struct EngineConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub alias: String,
+    /// When true (default), the engine starts without `-c` so llama.cpp uses
+    /// the selected model's own context window (and --fit shrinks it to the
+    /// available device memory). `ctx_size` is then only the fallback for
+    /// models whose metadata can't be read. When false, `ctx_size` is the
+    /// explicit, fixed context for every model.
+    #[serde(default = "default_true")]
+    pub auto_ctx: bool,
     pub ctx_size: u32,
     pub threads: u32,
+    /// Bearer keys the engine requires on every request (llama.cpp --api-key;
+    /// /health stays open). Generated at startup and persisted here; the UI
+    /// shows them next to the base URL so other local apps can connect.
+    /// Empty list = the engine runs open on localhost.
+    #[serde(default, rename = "apiKeys")]
+    pub api_keys: Vec<String>,
+    /// Legacy single-key field, kept in sync with api_keys[0] so configs and
+    /// tools written before multi-key support keep reading the primary key.
+    #[serde(default, rename = "apiKey")]
+    pub api_key: Option<String>,
     /// None = let llama.cpp auto-fit GPU offload to free VRAM (recommended:
     /// a manual value that exceeds VRAM crashes the engine).
     pub gpu_layers: Option<u32>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// When true, thinking models keep their reasoning enabled (the
+    /// --reasoning-budget 0 suppression is skipped) so reasoning_content
+    /// streams to clients that render it. Off by default: external
+    /// OpenAI-compatible apps that read only `content` then see empty
+    /// replies while the model thinks. Takes effect on engine restart.
+    #[serde(default, rename = "thinking")]
+    pub thinking: bool,
     pub scan_dirs: Vec<PathBuf>,
     /// Filename substrings that mark a .gguf as NOT a chat model
     /// (vision adapters, VAEs, CLIP towers, LoRAs, ASR...).
@@ -123,7 +148,7 @@ fn default_excludes() -> Vec<String> {
 }
 
 /// A remote OpenAI-compatible chat API (DeepSeek, OpenRouter, OpenAI, ...).
-/// The key lives in config.json on this PC — the app is local and private.
+/// The key lives in config.json on this PC: the app is local and private.
 #[derive(Deserialize, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteApi {
@@ -144,7 +169,7 @@ fn default_true() -> bool {
     true
 }
 
-/// One model entry inside a provider. `vision` only drives a UI badge —
+/// One model entry inside a provider. `vision` only drives a UI badge:
 /// whether images actually work is up to the provider and model.
 #[derive(Deserialize, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,6 +254,25 @@ impl Config {
         format!("http://{}:{}/v1", self.engine.host, self.engine.port)
     }
 
+    /// Effective bearer-key list: engine.apiKeys, falling back to the legacy
+    /// single engine.apiKey so older config.json files keep working.
+    pub fn api_keys(&self) -> Vec<String> {
+        let mut keys = self.engine.api_keys.clone();
+        if keys.is_empty() {
+            if let Some(k) = self.engine.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+                keys.push(k.to_string());
+            }
+        }
+        keys.retain(|k| !k.trim().is_empty());
+        keys
+    }
+
+    /// The key internal callers (agent, chat proxy, dsh patch) authenticate
+    /// with the first of the configured list, if any.
+    pub fn primary_api_key(&self) -> Option<String> {
+        self.api_keys().into_iter().next()
+    }
+
     /// Error text when `model` exceeds the configured RAM limit, else None.
     /// One gate shared by the CLI (`reload_engine`) and the web API. A GGUF
     /// model is one file; an AirLLM HF checkpoint is a folder, so its whole
@@ -258,6 +302,16 @@ impl Config {
     pub fn profile_for(&self, model: &Path) -> Option<&PerfProfile> {
         let stem = model.file_stem()?.to_string_lossy();
         self.engine.profiles.get(stem.as_ref())
+    }
+
+    /// Context window to serve for `model`: its own metadata when autoCtx is
+    /// on (GGUF `*.context_length` / HF `max_position_embeddings`), else the
+    /// fixed `ctxSize` from Settings.
+    pub fn effective_ctx(&self, model: &Path) -> u32 {
+        if !self.engine.auto_ctx {
+            return self.engine.ctx_size;
+        }
+        model_native_ctx(model).unwrap_or(self.engine.ctx_size)
     }
 
     /// Resolve a model: explicit path, or partial filename matched against the
@@ -311,7 +365,7 @@ fn is_excluded(name: &str, patterns: &[String]) -> bool {
 }
 
 /// Size of a model on disk: a GGUF is one file, an AirLLM HF checkpoint is a
-/// folder — count the whole top level plus one level of subfolders.
+/// folder: count the whole top level plus one level of subfolders.
 pub fn model_size(model: &Path) -> u64 {
     if model.is_dir() {
         dir_size(model)
@@ -320,7 +374,7 @@ pub fn model_size(model: &Path) -> u64 {
     }
 }
 
-/// Total size of every regular file under `dir` (two levels deep — HF
+/// Total size of every regular file under `dir` (two levels deep; HF
 /// checkpoints keep weights at the top, subfolders only hold tokenizers).
 fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
@@ -412,5 +466,185 @@ fn collect_ggufs_depth(dir: &Path, patterns: &[String], out: &mut Vec<PathBuf>, 
         } else if p.is_dir() {
             collect_ggufs_depth(&p, patterns, out, depth + 1);
         }
+    }
+}
+
+/// The context window a model was trained for, read from its own metadata:
+/// a GGUF's `*.context_length`, or an HF checkpoint folder's
+/// `max_position_embeddings`. None when the file/folder doesn't say.
+pub fn model_native_ctx(model: &Path) -> Option<u32> {
+    if model.is_dir() {
+        hf_native_ctx(model)
+    } else {
+        let mut r = BufReader::new(std::fs::File::open(model).ok()?);
+        read_gguf_ctx(&mut r).ok().flatten()
+    }
+}
+
+fn hf_native_ctx(dir: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // Multimodal configs keep the language tower's window under text_config.
+    let ctx = find_ctx_key(&v).or_else(|| v.get("text_config").and_then(find_ctx_key))?;
+    u32::try_from(ctx).ok().filter(|n| *n > 0)
+}
+
+fn find_ctx_key(v: &serde_json::Value) -> Option<u64> {
+    ["max_position_embeddings", "n_positions", "seq_length", "model_max_length"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+        .filter(|n| *n > 0)
+}
+
+/// Scan only the metadata block of a GGUF (before the tensor data) for the
+/// architecture's context length. Strings and arrays are seeked/skipped, so
+/// a multi-GB model costs a few small reads, and the scan gives up after
+/// 16 MB instead of walking a giant tokenizer table.
+fn read_gguf_ctx<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<u32>> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != b"GGUF" {
+        return Ok(None);
+    }
+    let version = read_u32(r)?;
+    if !(1..=3).contains(&version) {
+        return Ok(None);
+    }
+    let _tensor_count = read_u64(r)?;
+    let kv_count = read_u64(r)?;
+    for _ in 0..kv_count.min(4096) {
+        if r.stream_position()? > 16 * 1024 * 1024 {
+            return Ok(None);
+        }
+        let key = read_gguf_string(r, version)?;
+        let ty = read_u32(r)?;
+        let value = read_gguf_value(r, ty, version, 0)?;
+        if key.ends_with("context_length") {
+            let ctx = value.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+            return Ok(ctx);
+        }
+    }
+    Ok(None)
+}
+
+fn read_gguf_value<R: Read + Seek>(
+    r: &mut R,
+    ty: u32,
+    version: u32,
+    depth: u32,
+) -> std::io::Result<Option<u64>> {
+    if depth > 4 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF array too deep"));
+    }
+    Ok(match ty {
+        0 => Some(read_arr::<1, _>(r)?[0] as u64),
+        1 => Some(read_arr::<1, _>(r)?[0] as i8 as i64 as u64),
+        2 => Some(u16::from_le_bytes(read_arr(r)?) as u64),
+        3 => Some(i16::from_le_bytes(read_arr(r)?) as i64 as u64),
+        4 => Some(u32::from_le_bytes(read_arr(r)?) as u64),
+        5 => Some(i32::from_le_bytes(read_arr(r)?) as i64 as u64),
+        6 => {
+            r.seek(SeekFrom::Current(4))?;
+            None
+        }
+        7 => {
+            r.seek(SeekFrom::Current(1))?;
+            None
+        }
+        8 => {
+            let n = read_gguf_len(r, version)?;
+            r.seek(SeekFrom::Current(i64::try_from(n).unwrap_or(i64::MAX)))?;
+            None
+        }
+        9 => {
+            let elem_ty = read_u32(r)?;
+            let n = read_gguf_len(r, version)?;
+            if n > 10_000_000 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF array too long"));
+            }
+            for _ in 0..n {
+                read_gguf_value(r, elem_ty, version, depth + 1)?;
+            }
+            None
+        }
+        10 => Some(u64::from_le_bytes(read_arr(r)?)),
+        11 => Some(i64::from_le_bytes(read_arr(r)?) as u64),
+        12 => {
+            r.seek(SeekFrom::Current(8))?;
+            None
+        }
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown GGUF value type")),
+    })
+}
+
+fn read_gguf_string<R: Read>(r: &mut R, version: u32) -> std::io::Result<String> {
+    let n = read_gguf_len(r, version)?;
+    if n > 1 << 20 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF key too long"));
+    }
+    let mut buf = vec![0u8; n as usize];
+    r.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn read_gguf_len<R: Read>(r: &mut R, version: u32) -> std::io::Result<u64> {
+    if version >= 2 {
+        read_u64(r)
+    } else {
+        Ok(read_u32(r)? as u64)
+    }
+}
+
+fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
+    Ok(u32::from_le_bytes(read_arr(r)?))
+}
+
+fn read_u64<R: Read>(r: &mut R) -> std::io::Result<u64> {
+    Ok(u64::from_le_bytes(read_arr(r)?))
+}
+
+fn read_arr<const N: usize, R: Read>(r: &mut R) -> std::io::Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn push_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn reads_gguf_context_length_past_string_and_array_values() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&3u64.to_le_bytes()); // kv count
+        push_str(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes()); // string
+        push_str(&mut b, "llama");
+        push_str(&mut b, "tokenizer.ggml.tokens");
+        b.extend_from_slice(&9u32.to_le_bytes()); // array
+        b.extend_from_slice(&8u32.to_le_bytes()); // of strings
+        b.extend_from_slice(&2u64.to_le_bytes());
+        push_str(&mut b, "a");
+        push_str(&mut b, "bc");
+        push_str(&mut b, "llama.context_length");
+        b.extend_from_slice(&4u32.to_le_bytes()); // uint32
+        b.extend_from_slice(&262_144u32.to_le_bytes());
+
+        let got = read_gguf_ctx(&mut Cursor::new(b)).unwrap();
+        assert_eq!(got, Some(262_144));
+    }
+
+    #[test]
+    fn ignores_non_gguf_files() {
+        assert_eq!(read_gguf_ctx(&mut Cursor::new(b"nope".to_vec())).unwrap(), None);
     }
 }

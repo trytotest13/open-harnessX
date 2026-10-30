@@ -1,4 +1,4 @@
-//! Durable store for the Open Harness UI — the nanobot-pattern persistence
+//! Durable store for the Open Harness UI: the nanobot-pattern persistence
 //! layer: saved conversations, long-term memory, and agent task results.
 //!
 //! Everything is plain files under `<app root>/data/`:
@@ -33,7 +33,7 @@ fn memory_file() -> PathBuf {
     data_dir().join("memory").join("MEMORY.md")
 }
 
-/// Only `[A-Za-z0-9_-]`, capped at 64 chars — the same charset the UI's
+/// Only `[A-Za-z0-9_-]`, capped at 64 chars: the same charset the UI's
 /// `Date.now()+random` ids produce. Anything else becomes `_`, so a hostile
 /// id like `../../config.json` collapses to a harmless name.
 fn safe_id(raw: &str) -> String {
@@ -102,7 +102,7 @@ pub fn session_load(id: &str) -> Option<Value> {
 }
 
 /// Save a session `{id, title, ts, msgs}` sent by the browser. The transcript
-/// is the browser's own object mirrored verbatim — attachments' image parts
+/// is the browser's own object mirrored verbatim: attachments' image parts
 /// (data URLs) come along, capped so a handful of images can't fill the disk.
 pub fn session_save(body: &Value) -> Result<Value, String> {
     let id = body
@@ -113,14 +113,14 @@ pub fn session_save(body: &Value) -> Result<Value, String> {
         .ok_or("session id is missing")?;
     let id = safe_id(id);
     if !body.get("msgs").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
-        return Err("session has no messages — nothing to save".into());
+        return Err("session has no messages: nothing to save".into());
     }
     let mut rec = body.clone();
     rec["id"] = json!(id);
     rec["savedAt"] = json!(now_secs());
     let bytes = serde_json::to_vec(&rec).map_err(|e| e.to_string())?;
     if bytes.len() > 6 * 1024 * 1024 {
-        return Err("session too large to persist (>6 MB) — trim image attachments".into());
+        return Err("session too large to persist (>6 MB): trim image attachments".into());
     }
     atomic_write(&sessions_dir().join(format!("{id}.json")), &bytes)?;
     Ok(json!({ "ok": true, "id": id }))
@@ -175,7 +175,7 @@ pub fn memory_add(text: &str) -> Result<String, String> {
     Ok(cur)
 }
 
-/// Memory trimmed for prompt injection — the head is what gets cut, since
+/// Memory trimmed for prompt injection: the head is what gets cut, since
 /// `memory_add` appends and the newest entries matter most.
 pub fn memory_for_prompt(cap: usize) -> Option<String> {
     let m = memory_read();

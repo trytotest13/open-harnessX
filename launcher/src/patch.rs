@@ -1,7 +1,7 @@
 //! Writes the dsh profile patch that wires dsh (the opt-in agent IDE) to the
 //! local engine.
 //! Mirrors bin/configure-ide.js semantics; see docs/user/guide/providers.md
-//! in the dsh repo — a patch replaces the targeted row's whole config, so
+//! in the dsh repo: a patch replaces the targeted row's whole config, so
 //! each row restates every key it owns.
 
 use crate::config::Config;
@@ -34,7 +34,8 @@ pub fn patch_path() -> PathBuf {
     dsh_home().join("profiles").join("web").join("cordis.patch.yml")
 }
 
-pub fn write_patch(cfg: &Config, alias: &str) -> Result<PathBuf, String> {
+pub fn write_patch(cfg: &Config, model: &std::path::Path) -> Result<PathBuf, String> {
+    let alias = Config::alias_for(model);
     let path = patch_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -48,13 +49,13 @@ pub fn write_patch(cfg: &Config, alias: &str) -> Result<PathBuf, String> {
         println!("[oh] preserving existing non-managed rows in {}", path.display());
     }
 
-    let ctx = cfg.engine.ctx_size;
+    let ctx = crate::engine_ctx_for(cfg, model);
     let yaml = format!(
-        "# Managed by open-harness.exe — wires dsh to the local llama.cpp server.\n\
+        "# Managed by open-harness.exe: wires dsh to the local llama.cpp server.\n\
          # Model changes take effect on the next request; no restart needed.\n\
          # Non-managed rows below are preserved from previous edits.\n\
          {managed}{foreign}",
-        managed = managed_rows(cfg, alias, ctx),
+        managed = managed_rows(cfg, &alias, ctx),
         foreign = foreign,
     );
     std::fs::write(&path, yaml).map_err(|e| e.to_string())?;
@@ -62,6 +63,12 @@ pub fn write_patch(cfg: &Config, alias: &str) -> Result<PathBuf, String> {
 }
 
 fn managed_rows(cfg: &Config, alias: &str, ctx: u32) -> String {
+    // The engine rejects unauthenticated requests when an API key is set, so
+    // the provider row has to carry it (ensure_api_key guarantees it exists).
+    let auth = cfg
+        .primary_api_key()
+        .map(|k| format!("\x20       apiKey: {k}\n"))
+        .unwrap_or_default();
     format!(
         "- id: llm-pi-ai\n\
          \x20 config:\n\
@@ -69,6 +76,7 @@ fn managed_rows(cfg: &Config, alias: &str, ctx: u32) -> String {
          \x20     {DSH_PROVIDER_ID}:\n\
          \x20       api: openai-completions\n\
          \x20       baseURL: {base}\n\
+         {auth}\
          \x20       compat:\n\
          \x20         supportsDeveloperRole: false\n\
          \x20         maxTokensField: max_tokens\n\
@@ -83,7 +91,7 @@ fn managed_rows(cfg: &Config, alias: &str, ctx: u32) -> String {
          \x20   model: {alias}\n\
          \n\
          # The cloud DeepSeek routes are mounted by dsh's base bundle but are\n\
-         # unusable here without an API key — hide them from the model picker.\n\
+         # unusable here without an API key: hide them from the model picker.\n\
          - id: llm-deepseek\n\
          \x20 disabled: true\n\
          - id: llm-deepseek-account\n\
@@ -98,7 +106,7 @@ fn managed_rows(cfg: &Config, alias: &str, ctx: u32) -> String {
 
 /// Split a patch file into top-level `- id: <x>` blocks and return the ones
 /// whose id is not managed by this tool (header comments are dropped).
-/// Only column-0 "- id:" lines start a block — nested list entries (e.g. a
+/// Only column-0 "- id:" lines start a block: nested list entries (e.g. a
 /// model row under `models:`) are indented and stay inside their block.
 fn preserve_foreign_rows(text: &str) -> String {
     let mut blocks: Vec<Vec<&str>> = Vec::new();

@@ -1,4 +1,4 @@
-//! OCR fallback engine — a second llama-server instance running a dedicated
+//! OCR fallback engine: a second llama-server instance running a dedicated
 //! vision/OCR model (e.g. DeepSeek-OCR-2) on its own port. Chat models
 //! without a vision projector get image attachments transcribed into text
 //! before their request is proxied, so any local model can "see" images.
@@ -42,7 +42,7 @@ static OCR_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 static OCR_CACHE: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
 const OCR_CACHE_CAP: usize = 64;
 
-/// The configured fallback, but only when it is actually usable — both files
+/// The configured fallback, but only when it is actually usable: both files
 /// must exist on disk. Half-configured entries must not silently swallow
 /// image attachments, so they read as "not available".
 pub fn usable(cfg: &Config) -> Option<&OcrFallback> {
@@ -52,7 +52,7 @@ pub fn usable(cfg: &Config) -> Option<&OcrFallback> {
         .filter(|o| o.enabled && o.model.is_file() && o.mmproj.is_file())
 }
 
-/// Configured and files present — the UI may offer image attachments even
+/// Configured and files present: the UI may offer image attachments even
 /// when the loaded model has no vision.
 pub fn available(cfg: &Config) -> bool {
     usable(cfg).is_some()
@@ -61,7 +61,7 @@ pub fn available(cfg: &Config) -> bool {
 /// Sidecar currently answering on its port.
 pub fn running(cfg: &Config) -> bool {
     usable(cfg).is_some_and(|o| {
-        net::http_status(cfg.engine.host.as_str(), o.port, "/health", OCR_PROBE) == Some(200)
+        net::http_status(cfg.engine.host.as_str(), o.port, "/health", OCR_PROBE, None) == Some(200)
     })
 }
 
@@ -84,7 +84,7 @@ fn ocr_args(cfg: &Config, o: &OcrFallback) -> Vec<String> {
         // weights may fit on GPU while the vision encoder's ~1.6 GB compute
         // graph doesn't, which kills the request with cudaMalloc OOM
         // ("failed to process mtmd chunk"). DeepSeek-OCR-2 is a 3B-MoE with
-        // ~0.6B active params — full-CPU OCR runs in ~5 s, and never touches
+        // ~0.6B active params: full-CPU OCR runs in ~5 s, and never touches
         // the main model's VRAM.
         "-ngl".into(),
         "0".into(),
@@ -99,7 +99,7 @@ fn ocr_args(cfg: &Config, o: &OcrFallback) -> Vec<String> {
 }
 
 /// Make sure the sidecar is up, spawning it if needed; blocks until healthy.
-/// The returned borrow shares `cfg`'s lifetime — callers pass a config that
+/// The returned borrow shares `cfg`'s lifetime: callers pass a config that
 /// lives for the whole request, so that is all we need.
 fn ensure_running<'a>(cfg: &'a Config) -> Result<&'a OcrFallback, String> {
     let lock: MutexGuard<'_, ()> = OCR_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -129,7 +129,7 @@ fn ensure_running<'a>(cfg: &'a Config) -> Result<&'a OcrFallback, String> {
     let pid = child.id();
     let deadline = Instant::now() + OCR_START_TIMEOUT;
     while Instant::now() < deadline {
-        if net::http_status(cfg.engine.host.as_str(), o.port, "/health", OCR_PROBE) == Some(200) {
+        if net::http_status(cfg.engine.host.as_str(), o.port, "/health", OCR_PROBE, None) == Some(200) {
             // Remember the sidecar pid for stop/restart hygiene.
             let st = state::load(&state_path()).unwrap_or_default();
             let _ = state::save(
@@ -140,14 +140,14 @@ fn ensure_running<'a>(cfg: &'a Config) -> Result<&'a OcrFallback, String> {
         }
         if !crate::pid_alive(pid) {
             return Err(
-                "OCR engine exited while starting — see ocr-engine.log (wrong mmproj pairing, \
+                "OCR engine exited while starting: see ocr-engine.log (wrong mmproj pairing, \
                  out of VRAM, or unsupported architecture)"
                     .into(),
             );
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    Err("OCR engine did not become healthy within 180 s — see ocr-engine.log".into())
+    Err("OCR engine did not become healthy within 180 s: see ocr-engine.log".into())
 }
 
 /// POST one OpenAI-shaped chat request and return the response body, through
@@ -219,7 +219,7 @@ fn ocr_completion(
         OCR_COMPLETION_TIMEOUT.as_secs(),
     )?;
     let parsed: serde_json::Value = serde_json::from_str(&resp)
-        .map_err(|e| format!("OCR response was not JSON: {e} — {resp:.400}"))?;
+        .map_err(|e| format!("OCR response was not JSON: {e}; {resp:.400}"))?;
     let text = parsed
         .pointer("/choices/0/message/content")
         .and_then(|c| c.as_str())
@@ -255,7 +255,7 @@ pub fn transcribe(cfg: &Config, images: &[String]) -> Result<Vec<String>, String
     Ok(texts)
 }
 
-/// `transcribe` with a data-URL cache in front — history images come back
+/// `transcribe` with a data-URL cache in front: history images come back
 /// every turn and must not re-hit the OCR engine. One result per input, and
 /// only images the cache has never seen are actually transcribed.
 pub fn transcribe_cached(cfg: &Config, images: &[String]) -> Result<Vec<String>, String> {
@@ -329,11 +329,11 @@ pub fn rewrite_with_ocr(req: &mut serde_json::Value, texts: &[Option<String>]) {
             let replacement = match texts.get(idx).and_then(|t| t.clone()) {
                 Some(text) => json!({
                     "type": "text",
-                    "text": format!("[transcribed image attachment — OCR]\n{text}")
+                    "text": format!("[transcribed image attachment (OCR)]\n{text}")
                 }),
                 None => json!({
                     "type": "text",
-                    "text": "[an image was attached but could not be transcribed — the OCR engine failed]"
+                    "text": "[an image was attached but could not be transcribed: the OCR engine failed]"
                 }),
             };
             *part = replacement;

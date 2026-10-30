@@ -19,7 +19,12 @@ pub struct State {
     pub supervisor_pid: Option<u32>,
     #[serde(default)]
     pub model: String,
-    /// Last model confirmed healthy — the rollback target when a new load
+    /// Context window the running engine actually loaded (tokens), read from
+    /// /props after the model becomes healthy. None for engines started by
+    /// older builds or when the engine didn't report it.
+    #[serde(default, rename = "nCtx")]
+    pub n_ctx: Option<u32>,
+    /// Last model confirmed healthy: the rollback target when a new load
     /// fails (the "model" field may name a model that failed to load).
     #[serde(default)]
     pub last_healthy: Option<String>,

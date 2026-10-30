@@ -1,4 +1,4 @@
-//! open-harness.exe — launcher/supervisor for the Open Harness stack.
+//! open-harness.exe: launcher/supervisor for the Open Harness stack.
 //!
 //! Systems layer (Rust): starts/stops/waits on the llama.cpp engine, hot-swaps
 //! models, writes the dsh provider patch, serves the Open Harness web UI
@@ -64,7 +64,7 @@ fn main() {
         Some("wait") => cmd_wait(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(START_WAIT_SECS)),
         Some(_) => {
             eprintln!(
-                "Open Harness — local AI supervisor\n\n\
+                "Open Harness: local AI supervisor\n\n\
                  USAGE:\n\
                  \x20 open-harness app [model]    start stack, open the Open Harness window\n\
                  \x20 open-harness serve          headless: stack + web UI (blocks)\n\
@@ -85,7 +85,7 @@ fn main() {
 }
 
 fn arg_missing(usage: &str) -> i32 {
-    eprintln!("[oh] missing argument — usage: open-harness {usage}");
+    eprintln!("[oh] missing argument; usage: open-harness {usage}");
     2
 }
 
@@ -141,13 +141,37 @@ fn engine_args(cfg: &Config, model: &Path) -> Vec<String> {
         e.host.clone(),
         "--port".into(),
         e.port.to_string(),
-        "-c".into(),
-        e.ctx_size.to_string(),
         "-t".into(),
         threads.to_string(),
         "--alias".into(),
         Config::alias_for(model),
     ];
+    // llama-server accepts a comma-separated key list; internal callers and
+    // the dsh patch authenticate with the primary (first) key.
+    let keys = cfg.api_keys();
+    if !keys.is_empty() {
+        args.push("--api-key".into());
+        args.push(keys.join(","));
+    }
+    // Prefill speed: the default 512-token micro-batch leaves the GPU idle on
+    // long prompts (system prompt + tools + history), which is most of the
+    // time-to-first-token in agent runs. cache-reuse keeps the shared prompt
+    // prefix hot across the tool-calling loop's rounds even after older tool
+    // outputs get trimmed, so later rounds skip re-prefilling most of it.
+    args.push("-ub".into());
+    args.push("2048".into());
+    args.push("--cache-reuse".into());
+    args.push("256".into());
+    // Thinking models burn tokens (and seconds) in reasoning_content before
+    // any visible answer: external OpenAI-compatible apps that read only
+    // `content` then see an empty response. Budget 0 ends thinking up front,
+    // so answers stream straight into content. `thinking: true` in the
+    // engine config opts out, keeping reasoning enabled for clients that
+    // render reasoning_content.
+    if !e.thinking {
+        args.push("--reasoning-budget".into());
+        args.push("0".into());
+    }
     if let Some(ngl) = profile.and_then(|p| p.gpu_layers).or(e.gpu_layers) {
         args.push("-ngl".into());
         args.push(ngl.to_string());
@@ -165,6 +189,14 @@ fn engine_args(cfg: &Config, model: &Path) -> Vec<String> {
         }
     }
     args.extend(e.extra_args.iter().cloned());
+    // Auto context (default): leave -c unset so llama.cpp starts from the
+    // model's own window and --fit trims it to the device memory available.
+    // A fixed ctxSize in Settings still wins when the user turns auto off;
+    // it goes last so a "-c 0" left in extraArgs can't override it.
+    if !e.auto_ctx {
+        args.push("-c".into());
+        args.push(e.ctx_size.to_string());
+    }
     // Vision adapters only pair with their own model family (a mismatched
     // mmproj crashes the engine with an n_embd error).
     for rule in &e.mmproj_rules {
@@ -195,7 +227,7 @@ fn airllm_args(cfg: &Config, model: &Path) -> Vec<String> {
         "--port".into(),
         e.port.to_string(),
         "--max-seq-len".into(),
-        e.airllm_max_seq_len.unwrap_or(e.ctx_size).to_string(),
+        e.airllm_max_seq_len.unwrap_or_else(|| cfg.effective_ctx(model)).to_string(),
     ];
     if let Some(comp) = e.airllm_compression.as_deref() {
         args.push("--compression".into());
@@ -204,7 +236,92 @@ fn airllm_args(cfg: &Config, model: &Path) -> Vec<String> {
     args
 }
 
-pub(crate) fn engine_healthy(cfg: &Config) -> bool {    http_status(&cfg.engine.host, cfg.engine.port, "/health", ENGINE_HEALTH_TIMEOUT) == Some(200)
+pub(crate) fn engine_healthy(cfg: &Config) -> bool {
+    http_status(&cfg.engine.host, cfg.engine.port, "/health", ENGINE_HEALTH_TIMEOUT, cfg.primary_api_key().as_deref()) == Some(200)
+}
+
+/// The context window the running engine actually uses, from /props. This is
+/// the value llama.cpp settled on: the model's own window, possibly trimmed
+/// by --fit to the device memory available.
+pub(crate) fn engine_n_ctx(cfg: &Config) -> Option<u32> {
+    let body = net::http_get(
+        &cfg.engine.host,
+        cfg.engine.port,
+        "/props",
+        ENGINE_HEALTH_TIMEOUT,
+        cfg.primary_api_key().as_deref(),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.pointer("/default_generation_settings/n_ctx")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| v.get("n_ctx").and_then(serde_json::Value::as_u64))
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
+
+/// Context to show/config for `model`: the live engine value when that model
+/// is the one serving, else what it will get at the next load.
+pub(crate) fn engine_ctx_for(cfg: &Config, model: &Path) -> u32 {
+    let st = state::load(&state_path()).unwrap_or_default();
+    if same_path(Path::new(&st.model), model) {
+        if let Some(n) = st.n_ctx {
+            return n;
+        }
+    }
+    cfg.effective_ctx(model)
+}
+
+/// Make sure the engine has at least one API key in config.json, generating
+/// and persisting one when missing. The engine is started with `--api-key`
+/// so the local API is only usable by holders of a key; every internal
+/// caller sends the primary one too. Returns whether a key was newly
+/// generated: an engine already running from before has no `--api-key`, so
+/// callers force one reload in that case instead of trusting the no-op.
+pub(crate) fn ensure_api_key(cfg: &mut Config) -> Result<bool, String> {
+    if !cfg.api_keys().is_empty() {
+        return Ok(false);
+    }
+    let key = generate_api_key();
+    write_api_keys(&[key.clone()])?;
+    cfg.engine.api_keys = vec![key.clone()];
+    cfg.engine.api_key = Some(key);
+    println!("[oh] generated engine API key: see it in the UI dashboard (API access)");
+    Ok(true)
+}
+
+/// Persist the engine's bearer-key list into config.json. The first entry is
+/// also mirrored into the legacy single `apiKey` field for older readers.
+pub(crate) fn write_api_keys(keys: &[String]) -> Result<(), String> {
+    let path = config_path();
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read config.json: {e}"))?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad config.json: {e}"))?;
+    let eng = v
+        .get_mut("engine")
+        .and_then(|e| e.as_object_mut())
+        .ok_or("config.json has no engine object")?;
+    eng.insert("apiKeys".into(), serde_json::json!(keys));
+    eng.insert("apiKey".into(), serde_json::json!(keys.first().cloned()));
+    let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())
+}
+
+/// 128-bit key from OS entropy (each RandomState carries OS-random SipHash
+/// seeds) plus clock and ASLR jitter, ample for a localhost-only API.
+pub(crate) fn generate_api_key() -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut h);
+    let a = h.finish();
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    (&a as *const u64 as usize).hash(&mut h);
+    std::process::id().hash(&mut h);
+    let b = h.finish();
+    format!("oh-{:016x}{:016x}", a, b)
 }
 
 pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
@@ -222,7 +339,7 @@ fn spawn_engine(cfg: &Config, model: &Path) -> std::io::Result<u32> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
-                    "airllm venv python not found: {} — run engine\\airllm\\setup-airllm.bat once",
+                    "airllm venv python not found: {}, run engine\\airllm\\setup-airllm.bat once",
                     py.display()
                 ),
             ));
@@ -248,6 +365,7 @@ fn spawn_engine(cfg: &Config, model: &Path) -> std::io::Result<u32> {
     let mut st = state::load(&state_path()).unwrap_or_default();
     st.engine_pid = Some(pid);
     st.model = model.display().to_string();
+    st.n_ctx = None; // filled from /props once the new engine is healthy
     st.started_at = Some(unix_now());
     state::save(&state_path(), &st);
     println!("[oh]   pid {pid}");
@@ -265,8 +383,9 @@ fn spawn_engine(cfg: &Config, model: &Path) -> std::io::Result<u32> {
 /// Make the engine serve `model`: no-op when it already does, otherwise stop
 /// the current engine and start the new one. `wait_secs` = Some → block until
 /// healthy; None → return immediately (model loads in the background).
-fn reload_engine(cfg: &Config, model: &Path, wait_secs: Option<u64>) -> Result<bool, String> {
-    let already = engine_healthy(cfg)
+fn reload_engine(cfg: &Config, model: &Path, wait_secs: Option<u64>, force: bool) -> Result<bool, String> {
+    let already = !force
+        && engine_healthy(cfg)
         && loaded_model().is_some_and(|m| same_path(&m, model));
     if already {
         println!("[oh] engine already serving {}", model.display());
@@ -284,7 +403,7 @@ fn reload_engine(cfg: &Config, model: &Path, wait_secs: Option<u64>) -> Result<b
     }
     // Drain EVERY listener on the engine port before spawning. The state
     // pid can be stale while an orphaned engine still holds the port, and
-    // llama-server's SO_REUSEADDR lets two engines share it silently —
+    // llama-server's SO_REUSEADDR lets two engines share it silently:
     // requests then land on a random one of the two (wrong model, phantom
     // vision flags, mid-stream resets). Wait for the port to actually
     // empty instead of trusting a /health probe a second engine can keep
@@ -293,7 +412,7 @@ fn reload_engine(cfg: &Config, model: &Path, wait_secs: Option<u64>) -> Result<b
     while Instant::now() < deadline {
         match pid_listening_on(cfg.engine.port) {
             Some(pid) => {
-                println!("[oh] engine port {} still held by pid {pid} — stopping it", cfg.engine.port);
+                println!("[oh] engine port {} still held by pid {pid}, stopping it", cfg.engine.port);
                 let _ = kill_tree(pid);
                 std::thread::sleep(Duration::from_millis(400));
             }
@@ -307,18 +426,22 @@ fn reload_engine(cfg: &Config, model: &Path, wait_secs: Option<u64>) -> Result<b
     if let Some(secs) = wait_secs {
         println!("[oh] waiting for model to load (first load pages weights from disk)...");
         if !wait_healthy(cfg, secs) {
-            return Err("engine failed to load — see the error lines above / engine.log".into());
+            return Err("engine failed to load: see the error lines above / engine.log".into());
         }
-        // Bookkeep the last model that was confirmed serving.
+        // Bookkeep the last model that was confirmed serving, plus the
+        // context the engine settled on (--fit may have trimmed it).
         let mut st = state::load(&state_path()).unwrap_or_default();
         st.last_healthy = Some(model.display().to_string());
+        if let Some(n) = engine_n_ctx(cfg) {
+            st.n_ctx = Some(n);
+        }
         state::save(&state_path(), &st);
     }
     Ok(true)
 }
 
 /// The model that should be served: an explicit needle wins, otherwise keep
-/// whatever is already loaded, else the configured default — falling back to
+/// whatever is already loaded, else the configured default, falling back to
 /// the largest model that fits the RAM limit so the app still boots.
 fn desired_model(cfg: &Config, needle: Option<&str>) -> Result<PathBuf, String> {
     let Some(n) = needle else {
@@ -335,7 +458,7 @@ fn desired_model(cfg: &Config, needle: Option<&str>) -> Result<PathBuf, String> 
                     .max_by_key(|p| std::fs::metadata(p).map(|s| s.len()).unwrap_or(0));
                 if let Some(p) = fits {
                     println!(
-                        "[oh] default model is over the {limit:.0} GB RAM limit — using {} instead (change it in Settings)",
+                        "[oh] default model is over the {limit:.0} GB RAM limit, using {} instead (change it in Settings)",
                         Config::alias_for(&p)
                     );
                     return Ok(p);
@@ -364,7 +487,7 @@ fn spawn_dsh() -> std::io::Result<u32> {
 }
 
 /// Single-flight guard for agent IDE boots: the desktop app pre-starts dsh in
-/// the background, and the UI button can fire while that boot is in flight —
+/// the background, and the UI button can fire while that boot is in flight:
 /// a second competing spawn would just lose the port race and hang.
 static DSH_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -373,7 +496,7 @@ static DSH_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// dsh binds its port early but prints the URL line only after its plugin
 /// tree settles (~1 min warm, longer on the first npx download or while the
 /// engine is also loading a model). So: if the port is already open, WAIT for
-/// the URL instead of restarting — killing a booting dsh resets the whole
+/// the URL instead of restarting: killing a booting dsh resets the whole
 /// startup and is exactly what made the IDE feel impossible to open.
 pub(crate) fn ensure_dsh_url() -> Result<String, String> {
     use std::sync::atomic::Ordering;
@@ -382,11 +505,11 @@ pub(crate) fn ensure_dsh_url() -> Result<String, String> {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        // A pre-start or another request is already booting the IDE — wait
+        // A pre-start or another request is already booting the IDE: wait
         // for its URL instead of spawning a second dsh.
         return match wait_dsh_url(&log, 300) {
             Some(url) => Ok(url),
-            None => Err("agent IDE is still starting — try again in a moment".into()),
+            None => Err("agent IDE is still starting: try again in a moment".into()),
         };
     }
     let result = ensure_dsh_url_inner(&log);
@@ -397,7 +520,7 @@ pub(crate) fn ensure_dsh_url() -> Result<String, String> {
 fn ensure_dsh_url_inner(log: &Path) -> Result<String, String> {
     if port_open("127.0.0.1", DSH_PORT) {
         // The log is truncated on every spawn, so any URL in it belongs to
-        // the most recent dsh boot — the process now listening.
+        // the most recent dsh boot: the process now listening.
         if let Some(url) = dsh_url_from_log(&log) {
             println!("[oh] IDE already listening on port {DSH_PORT}");
             return Ok(url);
@@ -406,7 +529,7 @@ fn ensure_dsh_url_inner(log: &Path) -> Result<String, String> {
         if let Some(url) = wait_dsh_url(&log, 90) {
             return Ok(url);
         }
-        println!("[oh] IDE is running but its auth URL never appeared — restarting it");
+        println!("[oh] IDE is running but its auth URL never appeared, restarting it");
         if let Some(pid) = state::load(&state_path())
             .and_then(|s| s.dsh_pid)
             .or_else(|| pid_listening_on(DSH_PORT))
@@ -422,7 +545,7 @@ fn ensure_dsh_url_inner(log: &Path) -> Result<String, String> {
         Some(url) => Ok(url),
         None => Err(
             "agent IDE did not print its auth URL within 280s (see dsh-ide.log; \
-             the first-ever npx download or a busy disk can make this slow — try again)"
+             the first-ever npx download or a busy disk can make this slow, try again)"
                 .into(),
         ),
     }
@@ -459,7 +582,7 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
     else {
-        return true; // can't tell — assume alive and keep polling
+        return true; // can't tell: assume alive and keep polling
     };
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
@@ -502,18 +625,25 @@ fn wait_healthy(cfg: &Config, secs: u64) -> bool {
 }
 
 fn cmd_start(needle: Option<&str>) -> i32 {
-    let cfg = match load_config() {
+    let mut cfg = match load_config() {
         Ok(c) => c,
         Err(e) => return fail(&e),
+    };
+    let key_fresh = match ensure_api_key(&mut cfg) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[oh] WARNING: could not set up the engine API key: {e}");
+            false
+        }
     };
     let model = match desired_model(&cfg, needle) {
         Ok(m) => m,
         Err(e) => return fail(&e),
     };
-    if let Err(e) = reload_engine(&cfg, &model, Some(START_WAIT_SECS)) {
+    if let Err(e) = reload_engine(&cfg, &model, Some(START_WAIT_SECS), key_fresh) {
         return fail(&e);
     }
-    if let Err(e) = patch::write_patch(&cfg, &Config::alias_for(&model)) {
+    if let Err(e) = patch::write_patch(&cfg, &model) {
         eprintln!("[oh] WARNING: could not write dsh config: {e}");
     }
     let url = match ensure_dsh_url() {
@@ -528,7 +658,7 @@ fn cmd_start(needle: Option<&str>) -> i32 {
     println!("[oh] dsh:    {url}");
     println!("[oh] ────────────────────────────────────────────");
     remember_supervisor();
-    // The Open Harness UI lives in this process — stay alive until stopped.
+    // The Open Harness UI lives in this process: stay alive until stopped.
     match server::spawn() {
         Ok(p) => println!("[oh] UI: http://127.0.0.1:{p}"),
         Err(e) => eprintln!("[oh] WARNING: web UI unavailable: {e}"),
@@ -541,18 +671,25 @@ fn cmd_start(needle: Option<&str>) -> i32 {
 
 /// Headless Open Harness only: stack + web UI, no dsh. Blocks until stopped.
 fn cmd_serve() -> i32 {
-    let cfg = match load_config() {
+    let mut cfg = match load_config() {
         Ok(c) => c,
         Err(e) => return fail(&e),
+    };
+    let key_fresh = match ensure_api_key(&mut cfg) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[oh] WARNING: could not set up the engine API key: {e}");
+            false
+        }
     };
     let model = match desired_model(&cfg, None) {
         Ok(m) => m,
         Err(e) => return fail(&e),
     };
-    if let Err(e) = reload_engine(&cfg, &model, None) {
+    if let Err(e) = reload_engine(&cfg, &model, None, key_fresh) {
         return fail(&e);
     }
-    if let Err(e) = patch::write_patch(&cfg, &Config::alias_for(&model)) {
+    if let Err(e) = patch::write_patch(&cfg, &model) {
         eprintln!("[oh] WARNING: could not write dsh config: {e}");
     }
     remember_supervisor();
@@ -578,21 +715,28 @@ fn remember_supervisor() {
 /// running in the background; use `stop` to shut everything down.
 fn cmd_app(needle: Option<&str>) -> i32 {
     // Another Open Harness instance already owns the stack: never manage the
-    // engine from here (two supervisors would fight over one engine) — just
+    // engine from here (two supervisors would fight over one engine); just
     // open another window onto the running UI.
     if gui::ui_already_serving() {
-        println!("[oh] stack already running — opening a window on it");
+        println!("[oh] stack already running, opening a window on it");
         return match gui::open_app("Open Harness", || Ok(3080)) {
             Ok(()) => {
-                println!("[oh] window closed — the running instance keeps going");
+                println!("[oh] window closed: the running instance keeps going");
                 0
             }
             Err(e) => return fail(&e),
         };
     }
-    let cfg = match load_config() {
+    let mut cfg = match load_config() {
         Ok(c) => c,
         Err(e) => return fail(&e),
+    };
+    let key_fresh = match ensure_api_key(&mut cfg) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[oh] WARNING: could not set up the engine API key: {e}");
+            false
+        }
     };
     let model = match desired_model(&cfg, needle) {
         Ok(m) => m,
@@ -600,17 +744,17 @@ fn cmd_app(needle: Option<&str>) -> i32 {
     };
     // No blocking wait: the window opens while the model loads, and the UI
     // polls /api/status so it shows the load progress itself.
-    if let Err(e) = reload_engine(&cfg, &model, None) {
+    if let Err(e) = reload_engine(&cfg, &model, None, key_fresh) {
         return fail(&e);
     }
-    if let Err(e) = patch::write_patch(&cfg, &Config::alias_for(&model)) {
+    if let Err(e) = patch::write_patch(&cfg, &model) {
         eprintln!("[oh] WARNING: could not write dsh config: {e}");
     }
     remember_supervisor();
     println!("[oh] opening native window...");
     match gui::open_app("Open Harness", server::spawn) {
         Ok(()) => {
-            println!("[oh] window closed — engine keeps running in the background (stop with: open-harness stop)");
+            println!("[oh] window closed: engine keeps running in the background (stop with: open-harness stop)");
             0
         }
         Err(e) => {
@@ -626,7 +770,7 @@ fn cmd_app(needle: Option<&str>) -> i32 {
 /// health, update the dsh patch. The UI picks the new model up from
 /// /api/status. If the new model fails to load, roll back to the previously
 /// served one. Shared by the `load` CLI command and the web API.
-pub(crate) fn perform_load(model: &Path) -> Result<(), String> {
+pub(crate) fn perform_load(model: &Path, force: bool) -> Result<(), String> {
     let cfg = load_config()?;
     let previous = state::load(&state_path())
         .and_then(|s| s.last_healthy)
@@ -634,22 +778,21 @@ pub(crate) fn perform_load(model: &Path) -> Result<(), String> {
         .or_else(loaded_model);
     let alias = Config::alias_for(model);
     println!("[oh] loading {alias}");
-    if let Err(e) = reload_engine(&cfg, model, Some(START_WAIT_SECS)) {
+    if let Err(e) = reload_engine(&cfg, model, Some(START_WAIT_SECS), force) {
         eprintln!("[oh] load failed: {e}");
         if let Some(prev) = previous.filter(|p| !same_path(p, model)) {
             eprintln!("[oh] rolling back to {}", prev.display());
-            match reload_engine(&cfg, &prev, Some(300)) {
+            match reload_engine(&cfg, &prev, Some(300), false) {
                 Ok(_) => {
-                    let prev_alias = Config::alias_for(&prev);
-                    let _ = patch::write_patch(&cfg, &prev_alias);
-                    eprintln!("[oh] rollback OK — still serving {prev_alias}");
+                    let _ = patch::write_patch(&cfg, &prev);
+                    eprintln!("[oh] rollback OK: still serving {}", Config::alias_for(&prev));
                 }
                 Err(re) => eprintln!("[oh] rollback failed: {re}"),
             }
         }
         return Err(e);
     }
-    if let Err(e) = patch::write_patch(&cfg, &alias) {
+    if let Err(e) = patch::write_patch(&cfg, model) {
         eprintln!("[oh] WARNING: could not write dsh config: {e}");
     }
     println!("[oh] now serving: {alias}");
@@ -665,7 +808,7 @@ fn cmd_load(needle: &str) -> i32 {
         Ok(m) => m,
         Err(e) => return fail(&e),
     };
-    match perform_load(&model) {
+    match perform_load(&model, false) {
         Ok(()) => {
             println!("[oh] the UI picks it up automatically; dsh sessions pick it up on the next request");
             0
@@ -725,7 +868,7 @@ fn cmd_scan(dir: &str) -> i32 {
         let size = std::fs::metadata(m).map(|md| md.len()).unwrap_or(0);
         println!("  {} ({:.1} GB){}", Config::alias_for(m), size as f64 / 1e9, mark);
     }
-    println!("[oh] serve one with: open-harness load <partial-name> — or pick it in the UI");
+    println!("[oh] serve one with: open-harness load <partial-name>, or pick it in the UI");
     0
 }
 
@@ -781,7 +924,7 @@ fn report_doctor(findings: Vec<Finding>, as_json: bool, code: i32) -> i32 {
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
-        println!("[oh] doctor — hardware + stack report");
+        println!("[oh] doctor: hardware + stack report");
         for x in &findings {
             let mark = match x.status {
                 "ok" => "✓",
@@ -863,7 +1006,7 @@ fn cmd_doctor(as_json: bool) -> i32 {
         f.push(Finding::new(
             "warn",
             "GPU",
-            "none detected via nvidia-smi — inference will be CPU-only",
+            "none detected via nvidia-smi: inference will be CPU-only",
         ));
     } else {
         for g in &gpus {
@@ -893,7 +1036,7 @@ fn cmd_doctor(as_json: bool) -> i32 {
                 "fail",
                 "engine binary",
                 format!(
-                    "airllm venv python missing: {} — run engine\\airllm\\setup-airllm.bat",
+                    "airllm venv python missing: {}, run engine\\airllm\\setup-airllm.bat",
                     py.display()
                 ),
             ));
@@ -914,7 +1057,7 @@ fn cmd_doctor(as_json: bool) -> i32 {
                 size as f64 / 1e9
             ),
         ));
-        // Placement verdict — Colibri's multitier plan, in one line: what
+        // Placement verdict: Colibri's multitier plan, in one line: what
         // lives in VRAM, in RAM, or has to stream from disk.
         let vram_total: u64 = gpus.iter().map(|g| g.total * 1024 * 1024).sum();
         let ram_total = telemetry::sys_ram().map(|r| r.total).unwrap_or(0);
@@ -922,17 +1065,17 @@ fn cmd_doctor(as_json: bool) -> i32 {
             .ram_limit_gb
             .is_some_and(|lim| size as f64 > lim * 1e9);
         let tier = if vram_total > 0 && size <= vram_total {
-            "fits fully in VRAM — fastest tier"
+            "fits fully in VRAM: fastest tier"
         } else if size <= ram_total {
             "hybrid: auto-fit offloads what fits in VRAM, the rest stays resident in RAM via mmap"
         } else {
-            "model exceeds physical RAM — heavy disk streaming, expect slow decode"
+            "model exceeds physical RAM: heavy disk streaming, expect slow decode"
         };
         f.push(Finding::new(
             if over_limit { "warn" } else { "info" },
             "placement",
             if over_limit {
-                format!("{tier} (also over the configured RAM limit — load will be refused)")
+                format!("{tier} (also over the configured RAM limit, load will be refused)")
             } else {
                 tier.to_string()
             },
@@ -960,19 +1103,19 @@ fn cmd_doctor(as_json: bool) -> i32 {
         f.push(Finding::new(
             "ok",
             "engine",
-            format!("healthy at {} — serving {}", cfg.engine_base_url(), st.model),
+            format!("healthy at {}, serving {}", cfg.engine_base_url(), st.model),
         ));
     } else if st.engine_pid.is_some_and(crate::pid_alive) {
         f.push(Finding::new(
             "warn",
             "engine",
-            "process alive but not answering /health (still loading, or wedged — see engine.log)",
+            "process alive but not answering /health (still loading, or wedged, see engine.log)",
         ));
     } else {
         f.push(Finding::new(
             "info",
             "engine",
-            "not running — start with Start-IDE.bat or: open-harness app",
+            "not running: start with Start-IDE.bat or: open-harness app",
         ));
     }
 
@@ -989,7 +1132,7 @@ fn cmd_doctor(as_json: bool) -> i32 {
         f.push(Finding::new(
             "info",
             "tuned profiles",
-            "none yet — measure one with: open-harness tune",
+            "none yet: measure one with: open-harness tune",
         ));
     } else {
         f.push(Finding::new(
@@ -1165,7 +1308,7 @@ fn cmd_tune(needle: Option<&str>, quick: bool) -> i32 {
     if engine_healthy(&cfg) {
         println!(
             "[oh] NOTE: the engine is running and holds model memory. Bench still works \
-             (it mmaps the same file), but VRAM contention can skew GPU numbers — \
+             (it mmaps the same file), but VRAM contention can skew GPU numbers, \
              'open-harness stop' first for the cleanest measurement."
         );
     }
@@ -1188,7 +1331,7 @@ fn cmd_tune(needle: Option<&str>, quick: bool) -> i32 {
         ]
     };
     println!(
-        "[oh] tuning {} — {} config(s) × (pp {pp} + tg {n}) × {reps} rep(s); each config reloads the model",
+        "[oh] tuning {}: {} config(s) × (pp {pp} + tg {n}) × {reps} rep(s); each config reloads the model",
         Config::alias_for(&model),
         configs.len()
     );
@@ -1238,7 +1381,7 @@ fn cmd_tune(needle: Option<&str>, quick: bool) -> i32 {
         }
     }
     if results.is_empty() {
-        return fail("no bench config succeeded — see the errors above");
+        return fail("no bench config succeeded: see the errors above");
     }
     results.sort_by(|a, b| b.tok_s.partial_cmp(&a.tok_s).unwrap_or(std::cmp::Ordering::Equal));
     println!("[oh] results (fastest decode first):");
@@ -1252,7 +1395,7 @@ fn cmd_tune(needle: Option<&str>, quick: bool) -> i32 {
     let cpu_profile = cpu_only;
     match save_tuned_profile(&config_path(), &model, best, cpu_profile) {
         Ok(()) => println!(
-            "[oh] saved the tuned profile for {} — it applies the next time this model loads (engine_args picks it up; Settings values you typed still win)",
+            "[oh] saved the tuned profile for {}: it applies the next time this model loads (engine_args picks it up; Settings values you typed still win)",
             Config::alias_for(&model)
         ),
         Err(e) => return fail(&format!("could not save the profile: {e}")),

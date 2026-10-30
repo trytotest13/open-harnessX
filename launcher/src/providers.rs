@@ -1,4 +1,4 @@
-//! Provider chat proxy — routes a chat request through a cloud provider in
+//! Provider chat proxy: routes a chat request through a cloud provider in
 //! one of three wire formats and translates the answer back into the
 //! OpenAI-compatible SSE the UI already streams. The upstream request is
 //! piped through Windows' bundled curl.exe (std Rust has no TLS; curl also
@@ -225,7 +225,7 @@ fn run_upstream(
         }
         if data == "[DONE]" {
             // OpenAI-format upstreams end their own stream; forward the
-            // terminator and stop — no fallback usage chunk after this, or it
+            // terminator and stop: no fallback usage chunk after this, or it
             // would clobber the real usage the upstream just reported.
             client.write_all(b"data: [DONE]\n\n")?;
             finished = true;
@@ -238,7 +238,7 @@ fn run_upstream(
         }
     }
     if !finished {
-        // Upstream closed without a terminal event — still emit the usage
+        // Upstream closed without a terminal event: still emit the usage
         // chunk + terminator so the UI's stream reader ends cleanly.
         write_sse(
             client,
@@ -297,7 +297,7 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 /// mandatory upstream, so it defaults when the UI didn't send one.
 fn anthropic_request(req: &serde_json::Value, p: &Provider) -> Result<serde_json::Value, String> {
     if p.api_key.trim().is_empty() {
-        return Err("this provider has no API key — add one on the Providers page".into());
+        return Err("this provider has no API key: add one on the Providers page".into());
     }
     let mut out = serde_json::json!({
         "model": req.get("model").cloned().unwrap_or(serde_json::json!("")),
@@ -464,7 +464,7 @@ fn final_anthropic(msg: serde_json::Value, x: &mut Xlate) -> serde_json::Value {
 
 fn responses_request(req: &serde_json::Value, p: &Provider) -> Result<serde_json::Value, String> {
     if p.api_key.trim().is_empty() {
-        return Err("this provider has no API key — add one on the Providers page".into());
+        return Err("this provider has no API key: add one on the Providers page".into());
     }
     let mut instructions = String::new();
     let mut input: Vec<serde_json::Value> = Vec::new();

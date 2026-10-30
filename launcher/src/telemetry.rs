@@ -1,7 +1,7 @@
 //! Machine + engine telemetry: system RAM, GPU VRAM (nvidia-smi), and the
 //! engine process's own memory. This is the data behind the dashboard's
-//! multitier view — how much of the model lives in VRAM, in RAM, or is still
-//! streamed from disk — Colibri's "one hierarchy" idea, measured with the
+//! multitier view: how much of the model lives in VRAM, in RAM, or is still
+//! streamed from disk: Colibri's "one hierarchy" idea, measured with the
 //! tools Windows actually gives us. All calls are cheap, cached, and fail
 //! soft: a missing GPU or an unopenable process degrades one number, never
 //! the whole report.
@@ -94,7 +94,7 @@ mod win {
     }
 
     /// Resident working set of one process, bytes (None = can't tell).
-    /// Limited-information access first — full query access can be denied
+    /// Limited-information access first: full query access can be denied
     /// even for same-user processes; GetProcessMemoryInfo accepts both.
     pub fn working_set(pid: u32) -> Option<u64> {
         unsafe {
@@ -155,7 +155,7 @@ fn nvidia_smi(args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// GPUs on this machine. Cached for 5 s — the dashboard polls every 2 s and
+/// GPUs on this machine. Cached for 5 s: the dashboard polls every 2 s and
 /// spawning nvidia-smi that often is rude.
 pub fn gpus() -> Vec<Gpu> {
     static CACHE: Mutex<Option<(Instant, Vec<Gpu>)>> = Mutex::new(None);
@@ -190,8 +190,8 @@ fn gpus_uncached() -> Vec<Gpu> {
 /// VRAM a specific PID holds, in bytes (0 = none measurable).
 ///
 /// WDDM laptops don't expose per-process VRAM to nvidia-smi (`[N/A]` rows),
-/// so the primary source is the Windows "GPU Engine" performance counter —
-/// the same per-process Dedicated Usage Task Manager shows — with nvidia-smi
+/// so the primary source is the Windows "GPU Engine" performance counter:
+/// the same per-process Dedicated Usage Task Manager shows, with nvidia-smi
 /// compute-apps rows (which do carry numbers on TCC/older drivers) as the
 /// fallback. The result is cached for 3 s (dashboard poll rate).
 pub fn gpu_vram_bytes_of(pid: u32) -> u64 {

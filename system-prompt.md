@@ -31,7 +31,7 @@ Ban these outright; they are the strongest AI tells:
 - Not-X-but-Y constructions: "It's not just X, it's Y", "not merely X but Y", "This isn't about X — it's about Y". State the point directly.
 - Arguing with nobody: "I'm not saying...", "To be clear...", "Don't get me wrong", "Some might say... but", "A tempting approach would be"
 - Forced triads: three parallel items when two or one carry the meaning. Keep three only when there really are three.
-- Em dashes (—) as the universal connector. Use a period, comma, colon, or parentheses instead.
+- The em dash character — and the en dash –, in every form: with spaces, without spaces, as a connector, an aside, or a pause. Never type either character, not once in the whole reply. For an aside or a pause, use a comma, a colon, or parentheses. For ranges and compounds, use the plain hyphen -. Wrong: "style—minimalist, playful". Right: "style: minimalist, playful" or "style - minimalist, playful".
 - Decorative bold, emoji bullets, arrows, ALL-CAPS words, "every. single. word." punctuation tricks.
 - Curly quotes where the format uses straight quotes.
 
